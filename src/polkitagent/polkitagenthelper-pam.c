@@ -28,6 +28,10 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <signal.h>
 #include <syslog.h>
 #include <security/pam_appl.h>
 
@@ -43,7 +47,38 @@
 #  endif
 #endif
 
+/* The stack every agent has always been authenticated against. It converses
+ * with the agent over stdin/stdout and is expected to ask for a password.
+ */
+#define PAM_SERVICE_NAME "polkit-1"
+
+/* An optional second stack, run concurrently with the first, for
+ * authentication that takes time rather than input -- a fingerprint, a
+ * smartcard tap. It is given a conversation that answers nothing, so it must
+ * not prompt. Distributions that do not ship it get exactly the behaviour
+ * polkit had before this existed.
+ */
+#define PAM_SERVICE_NAME_CONCURRENT "polkit-1-biometric"
+
+/* Where the above is looked for. Linux-PAM reads both, preferring the
+ * administrator's copy in the first.
+ */
+static const char *pam_service_directories[] = { "/etc/pam.d", "/usr/lib/pam.d" };
+
+/* Single byte written back by the concurrent child to report its verdict. */
+#define CONCURRENT_VERDICT_SUCCESS 'y'
+
+/* Shared with the conversation function so that a password prompt nobody is
+ * going to answer stops being waited on the moment the other stack wins.
+ */
+typedef struct
+{
+  int verdict_fd;             /* read end of the child's pipe, -1 once done */
+  gboolean concurrent_won;
+} ConversationData;
+
 static int conversation_function (int n, const struct pam_message **msg, struct pam_response **resp, void *data);
+static int null_conversation_function (int n, const struct pam_message **msg, struct pam_response **resp, void *data);
 
 static void
 send_to_helper (const gchar *str1,
@@ -81,6 +116,200 @@ send_to_helper (const gchar *str1,
   g_free (tmp2);
 }
 
+/* The whole of what it means to authenticate: the stack ran, the account is
+ * permitted, and the user it ended up authenticating is the one we asked
+ * about. Both the password stack and the concurrent stack must clear all
+ * three, so neither can be a weaker way in than the other.
+ */
+static gboolean
+authenticate_with_pam (const char *service,
+                       const char *user_to_auth,
+                       struct pam_conv *conversation)
+{
+  pam_handle_t *pam_h = NULL;
+  const void *authed_user;
+  gboolean authenticated = FALSE;
+  int rc;
+
+  rc = pam_start (service, user_to_auth, conversation, &pam_h);
+  if (rc != PAM_SUCCESS)
+    {
+      fprintf (stderr, "polkit-agent-helper-1: pam_start failed: %s\n", pam_strerror (pam_h, rc));
+      goto out;
+    }
+
+  rc = pam_set_item (pam_h, PAM_RUSER, user_to_auth);
+  if (rc != PAM_SUCCESS)
+    {
+      fprintf (stderr, "polkit-agent-helper-1: pam_set_item failed: %s\n", pam_strerror (pam_h, rc));
+      goto out;
+    }
+
+  /* is user really user? */
+  rc = pam_authenticate (pam_h, 0);
+  if (rc != PAM_SUCCESS)
+    {
+      fprintf (stderr, "polkit-agent-helper-1: pam_authenticate failed: %s\n", pam_strerror (pam_h, rc));
+      goto out;
+    }
+
+  /* permitted access? */
+  rc = pam_acct_mgmt (pam_h, 0);
+  if (rc != PAM_SUCCESS)
+    {
+      fprintf (stderr, "polkit-agent-helper-1: pam_acct_mgmt failed: %s\n", pam_strerror (pam_h, rc));
+      goto out;
+    }
+
+  /* did we auth the right user? */
+  rc = pam_get_item (pam_h, PAM_USER, &authed_user);
+  if (rc != PAM_SUCCESS)
+    {
+      fprintf (stderr, "polkit-agent-helper-1: pam_get_item failed: %s\n", pam_strerror (pam_h, rc));
+      goto out;
+    }
+
+  if (strcmp (authed_user, user_to_auth) != 0)
+    {
+      fprintf (stderr, "polkit-agent-helper-1: Tried to auth user '%s' but we got auth for user '%s' instead",
+               user_to_auth, (const char *) authed_user);
+      goto out;
+    }
+
+  authenticated = TRUE;
+
+out:
+  if (pam_h != NULL)
+    pam_end (pam_h, rc);
+  return authenticated;
+}
+
+static gboolean
+pam_service_exists (const char *service)
+{
+  gsize i;
+
+  for (i = 0; i < G_N_ELEMENTS (pam_service_directories); i++)
+    {
+      char *path;
+      gboolean found;
+
+      path = g_build_filename (pam_service_directories[i], service, NULL);
+      found = g_file_test (path, G_FILE_TEST_IS_REGULAR);
+      g_free (path);
+
+      if (found)
+        return TRUE;
+    }
+
+  return FALSE;
+}
+
+/* Runs PAM_SERVICE_NAME_CONCURRENT in a child process and returns the read
+ * end of the pipe it will report its verdict on, or -1 if no such stack is
+ * configured.
+ *
+ * A separate process rather than a thread: PAM is not thread-safe, and a
+ * module that wedges must be killable without taking the password prompt
+ * down with it. The child never touches the agent's stdin or stdout, so the
+ * protocol on those descriptors stays exactly what it was and every existing
+ * agent keeps working unmodified.
+ */
+static int
+start_concurrent_authentication (const char *user_to_auth,
+                                 pid_t *out_child)
+{
+  struct pam_conv conversation;
+  int pipe_fds[2];
+  pid_t child;
+  int devnull;
+  char verdict;
+
+  *out_child = -1;
+
+  if (!pam_service_exists (PAM_SERVICE_NAME_CONCURRENT))
+    return -1;
+
+  if (pipe (pipe_fds) != 0)
+    {
+      syslog (LOG_NOTICE, "could not create pipe for %s: %m", PAM_SERVICE_NAME_CONCURRENT);
+      return -1;
+    }
+
+  child = fork ();
+  if (child < 0)
+    {
+      syslog (LOG_NOTICE, "could not fork for %s: %m", PAM_SERVICE_NAME_CONCURRENT);
+      close (pipe_fds[0]);
+      close (pipe_fds[1]);
+      return -1;
+    }
+
+  if (child > 0)
+    {
+      close (pipe_fds[1]);
+      /* Also done in the child, so that whoever gets there first has put it
+       * in its own process group before the race can be decided.
+       */
+      setpgid (child, child);
+      *out_child = child;
+      return pipe_fds[0];
+    }
+
+  /* Child. The agent's descriptors are replaced before running any PAM
+   * module, so that nothing the concurrent stack does can be mistaken for a
+   * message from the conversation the agent is listening to.
+   */
+  close (pipe_fds[0]);
+
+  /* Its own process group, so that losing the race takes down anything the
+   * stack started as well as the stack itself. A module that leaks a process
+   * still holding the reader would make the next authentication fail.
+   */
+  setpgid (0, 0);
+
+  devnull = open ("/dev/null", O_RDWR);
+  if (devnull >= 0)
+    {
+      dup2 (devnull, STDIN_FILENO);
+      dup2 (devnull, STDOUT_FILENO);
+      if (devnull > STDERR_FILENO)
+        close (devnull);
+    }
+
+  conversation.conv = null_conversation_function;
+  conversation.appdata_ptr = NULL;
+
+  verdict = authenticate_with_pam (PAM_SERVICE_NAME_CONCURRENT, user_to_auth, &conversation)
+            ? CONCURRENT_VERDICT_SUCCESS : 'n';
+
+  /* A short write or a dead parent both mean nobody is listening any more. */
+  if (write (pipe_fds[1], &verdict, 1) != 1)
+    _exit (1);
+
+  _exit (verdict == CONCURRENT_VERDICT_SUCCESS ? 0 : 1);
+}
+
+static void
+stop_concurrent_authentication (pid_t child,
+                                int verdict_fd)
+{
+  if (verdict_fd >= 0)
+    close (verdict_fd);
+
+  if (child <= 0)
+    return;
+
+  /* The whole group, and SIGKILL rather than SIGTERM: the child may be inside
+   * a PAM module that installed its own handler, and there is nothing either
+   * it or anything it spawned needs to clean up that exiting will not.
+   */
+  if (kill (-child, SIGKILL) != 0 && errno == ESRCH)
+    kill (child, SIGKILL);
+  while (waitpid (child, NULL, 0) < 0 && errno == EINTR)
+    ;
+}
+
 int
 main (int argc, char *argv[])
 {
@@ -92,11 +321,10 @@ main (int argc, char *argv[])
   char *user_to_auth_free = NULL;
   char *cookie = NULL;
   struct pam_conv pam_conversation;
-  pam_handle_t *pam_h;
-  const void *authed_user;
+  ConversationData conversation_data = { -1, FALSE };
+  pid_t concurrent_child = -1;
 
   rc = 0;
-  pam_h = NULL;
 
   char *lang = getenv("LANG");
   char *language = getenv("LANGUAGE");
@@ -212,73 +440,31 @@ main (int argc, char *argv[])
 #endif /* PAH_DEBUG */
 
   pam_conversation.conv        = conversation_function;
-  pam_conversation.appdata_ptr = NULL;
+  pam_conversation.appdata_ptr = &conversation_data;
 
-  /* start the pam stack */
-  rc = pam_start ("polkit-1",
-                  user_to_auth,
-                  &pam_conversation,
-                  &pam_h);
-  if (rc != PAM_SUCCESS)
+  /* A stack that can succeed without being asked anything runs alongside the
+   * one that talks to the agent, so that reaching for the reader and reaching
+   * for the keyboard are both answered promptly. PAM conversations are
+   * serial, which is why this has to be a second conversation rather than
+   * another module in the first one.
+   */
+  conversation_data.verdict_fd = start_concurrent_authentication (user_to_auth, &concurrent_child);
+
+  if (!authenticate_with_pam (PAM_SERVICE_NAME, user_to_auth, &pam_conversation) &&
+      !conversation_data.concurrent_won)
     {
-      fprintf (stderr, "polkit-agent-helper-1: pam_start failed: %s\n", pam_strerror (pam_h, rc));
-      goto error;
-    }
-
-  /* set the requesting user */
-  rc = pam_set_item (pam_h, PAM_RUSER, user_to_auth);
-  if (rc != PAM_SUCCESS)
-    {
-      fprintf (stderr, "polkit-agent-helper-1: pam_set_item failed: %s\n", pam_strerror (pam_h, rc));
-      goto error;
-    }
-
-  /* is user really user? */
-  rc = pam_authenticate (pam_h, 0);
-  if (rc != PAM_SUCCESS)
-    {
-      const char *err;
-      err = pam_strerror (pam_h, rc);
-      fprintf (stderr, "polkit-agent-helper-1: pam_authenticate failed: %s\n", err);
-
       /* if run via systemd socket, failed authentication won't taint the system using SuccessExitStatus=2*/
       errval = 2;
       goto error;
     }
 
-  /* permitted access? */
-  rc = pam_acct_mgmt (pam_h, 0);
-  if (rc != PAM_SUCCESS)
-    {
-      const char *err;
-      err = pam_strerror (pam_h, rc);
-      fprintf (stderr, "polkit-agent-helper-1: pam_acct_mgmt failed: %s\n", err);
-      goto error;
-    }
-
-  /* did we auth the right user? */
-  rc = pam_get_item (pam_h, PAM_USER, &authed_user);
-  if (rc != PAM_SUCCESS)
-    {
-      const char *err;
-      err = pam_strerror (pam_h, rc);
-      fprintf (stderr, "polkit-agent-helper-1: pam_get_item failed: %s\n", err);
-      goto error;
-    }
-
-  if (strcmp (authed_user, user_to_auth) != 0)
-    {
-      fprintf (stderr, "polkit-agent-helper-1: Tried to auth user '%s' but we got auth for user '%s' instead",
-               user_to_auth, (const char *) authed_user);
-      goto error;
-    }
+  stop_concurrent_authentication (concurrent_child, conversation_data.verdict_fd);
+  concurrent_child = -1;
+  conversation_data.verdict_fd = -1;
 
 #ifdef PAH_DEBUG
   fprintf (stderr, "polkit-agent-helper-1: successfully authenticated user '%s'.\n", user_to_auth);
 #endif /* PAH_DEBUG */
-
-  pam_end (pam_h, rc);
-  pam_h = NULL;
 
 #ifdef PAH_DEBUG
   fprintf (stderr, "polkit-agent-helper-1: sending D-Bus message to PolicyKit daemon\n");
@@ -314,8 +500,7 @@ error:
   free (user_to_auth_free);
   if (pidfd >= 0)
     close (pidfd);
-  if (pam_h != NULL)
-    pam_end (pam_h, rc);
+  stop_concurrent_authentication (concurrent_child, conversation_data.verdict_fd);
 
   fprintf (stdout, "FAILURE\n");
   flush_and_wait();
@@ -329,7 +514,8 @@ conversation_function (int n, const struct pam_message **msg, struct pam_respons
   char buf[PAM_MAX_RESP_SIZE];
   int i;
 
-  (void)data;
+  ConversationData *conversation_data = data;
+
   if (n <= 0 || n > PAM_MAX_NUM_MSG)
     return PAM_CONV_ERR;
 
@@ -351,12 +537,35 @@ conversation_function (int n, const struct pam_message **msg, struct pam_respons
           send_to_helper ("PAM_PROMPT_ECHO_ON", msg[i]->msg);
 
         conv1:
-          if (fgets (buf, sizeof buf, stdin) == NULL)
-            goto error;
+          /* Wait for the agent's answer, but not only for it: the concurrent
+           * stack winning means this prompt will never be answered, and
+           * nothing else would ever wake us from it.
+           */
+          for (;;)
+            {
+              gboolean concurrent_ready = FALSE;
+              int verdict_fd = conversation_data != NULL ? conversation_data->verdict_fd : -1;
+              char verdict;
 
-          if (strlen (buf) > 0 &&
-              buf[strlen (buf) - 1] == '\n')
-            buf[strlen (buf) - 1] = '\0';
+              if (read_line_from_agent (buf, sizeof buf, verdict_fd, &concurrent_ready) == 1)
+                break;
+
+              if (!concurrent_ready)
+                goto error;
+
+              /* Success there ends the request here. Failure only means this
+               * prompt is once again the only way through, so stop watching
+               * and keep waiting for the agent.
+               */
+              if (read (verdict_fd, &verdict, 1) == 1 && verdict == CONCURRENT_VERDICT_SUCCESS)
+                {
+                  conversation_data->concurrent_won = TRUE;
+                  goto error;
+                }
+
+              close (verdict_fd);
+              conversation_data->verdict_fd = -1;
+            }
 
           aresp[i].resp = strdup (buf);
           if (aresp[i].resp == NULL)
@@ -392,4 +601,48 @@ error:
   free (aresp);
   *resp = NULL;
   return PAM_CONV_ERR;
+}
+
+/* Answers nothing. The concurrent stack has no one to ask -- the agent is
+ * busy with the other conversation -- so a module that prompts is a
+ * misconfiguration rather than something to paper over: the conversation
+ * fails and that stack simply loses the race.
+ */
+static int
+null_conversation_function (int n, const struct pam_message **msg, struct pam_response **resp, void *data)
+{
+  struct pam_response *aresp;
+  int i;
+
+  (void)data;
+  if (n <= 0 || n > PAM_MAX_NUM_MSG)
+    return PAM_CONV_ERR;
+
+  if ((aresp = calloc (n, sizeof *aresp)) == NULL)
+    return PAM_BUF_ERR;
+
+  for (i = 0; i < n; ++i)
+    {
+      aresp[i].resp_retcode = 0;
+      aresp[i].resp = NULL;
+
+      switch (msg[i]->msg_style)
+        {
+        case PAM_ERROR_MSG:
+        case PAM_TEXT_INFO:
+          /* Dropped rather than forwarded: these belong to a conversation the
+           * agent is not having, and interleaving them with the password
+           * prompt's messages would mislead whoever is reading them.
+           */
+          break;
+
+        default:
+          free (aresp);
+          *resp = NULL;
+          return PAM_CONV_ERR;
+        }
+    }
+
+  *resp = aresp;
+  return PAM_SUCCESS;
 }
