@@ -26,6 +26,7 @@
 #include <stdlib.h>
 #include <errno.h>
 #include <unistd.h>
+#include <poll.h>
 
 #ifndef HAVE_CLEARENV
 extern char **environ;
@@ -46,6 +47,121 @@ _polkit_clearenv (void)
 #endif
 
 
+#define POLKIT_AGENT_MAX_COOKIE 4096
+#define AGENT_LINE_BUFFER_SIZE (POLKIT_AGENT_MAX_COOKIE + 2) /* +1 newline, +1 NUL */
+
+/* Bytes read from stdin but not yet handed to a caller. Owning this buffer
+ * ourselves -- rather than letting stdio own it -- is what lets a caller
+ * poll() stdin alongside another descriptor without losing data.
+ */
+static char agent_buffer[AGENT_LINE_BUFFER_SIZE];
+static size_t agent_buffer_used;
+
+/* Returns 1 and fills @out if a complete line is buffered, 0 if it is not
+ * yet, -1 if the line cannot fit in @out.
+ */
+static int
+take_buffered_line (char *out,
+                    size_t out_size)
+{
+  char *newline;
+  size_t length;
+
+  newline = memchr (agent_buffer, '\n', agent_buffer_used);
+  if (newline == NULL)
+    return 0;
+
+  length = newline - agent_buffer;
+  if (length + 1 > out_size)
+    {
+      errno = EOVERFLOW;
+      return -1;
+    }
+
+  memcpy (out, agent_buffer, length);
+  out[length] = '\0';
+
+  agent_buffer_used -= length + 1;
+  memmove (agent_buffer, newline + 1, agent_buffer_used);
+
+  return 1;
+}
+
+int
+read_line_from_agent (char *out,
+                      size_t out_size,
+                      int extra_fd,
+                      gboolean *extra_signalled)
+{
+  if (extra_signalled != NULL)
+    *extra_signalled = FALSE;
+
+  for (;;)
+    {
+      struct pollfd fds[2];
+      nfds_t nfds;
+      ssize_t bytes_read;
+      int result;
+
+      result = take_buffered_line (out, out_size);
+      if (result != 0)
+        return result;
+
+      if (agent_buffer_used == sizeof agent_buffer)
+        {
+          errno = EOVERFLOW;
+          return -1;
+        }
+
+      fds[0].fd = STDIN_FILENO;
+      fds[0].events = POLLIN;
+      fds[0].revents = 0;
+      nfds = 1;
+
+      if (extra_fd >= 0)
+        {
+          fds[1].fd = extra_fd;
+          fds[1].events = POLLIN;
+          fds[1].revents = 0;
+          nfds = 2;
+        }
+
+      if (poll (fds, nfds, -1) < 0)
+        {
+          if (errno == EINTR)
+            continue;
+          return -1;
+        }
+
+      /* The extra descriptor is checked first: once it has something to say
+       * we stop caring about a password that has not arrived yet.
+       */
+      if (nfds == 2 && fds[1].revents != 0)
+        {
+          if (extra_signalled != NULL)
+            *extra_signalled = TRUE;
+          return 0;
+        }
+
+      if (fds[0].revents == 0)
+        continue;
+
+      bytes_read = read (STDIN_FILENO,
+                         agent_buffer + agent_buffer_used,
+                         sizeof agent_buffer - agent_buffer_used);
+      if (bytes_read < 0)
+        {
+          if (errno == EINTR)
+            continue;
+          return -1;
+        }
+      if (bytes_read == 0)
+        return -1; /* EOF */
+
+      agent_buffer_used += bytes_read;
+    }
+}
+
 char *
 read_cookie (int argc, char **argv)
 {
@@ -60,17 +176,12 @@ read_cookie (int argc, char **argv)
     return strdup (argv[2]);
   else
     {
-      #define POLKIT_AGENT_MAX_COOKIE 4096
-      char buf[POLKIT_AGENT_MAX_COOKIE + 2]; /* +1 for newline, +1 for NUL */
-      if (fgets (buf, sizeof(buf), stdin) == NULL)
+      char buf[AGENT_LINE_BUFFER_SIZE];
+
+      if (read_line_from_agent (buf, sizeof buf, -1, NULL) != 1)
         {
-          if (!feof (stdin))
-            perror ("fgets");
-          return NULL;
-        }
-      if (buf[strlen (buf) - 1] != '\n')
-        {
-          errno = EOVERFLOW;
+          if (errno != 0)
+            perror ("read_line_from_agent");
           return NULL;
         }
       g_strchomp (buf);

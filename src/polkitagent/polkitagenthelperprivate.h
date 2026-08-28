@@ -37,6 +37,18 @@
 
 int _polkit_clearenv (void);
 
+/* Reads one newline-terminated line from stdin into @out (newline stripped).
+ *
+ * Returns 1 on success, -1 on EOF, overflow or error, and 0 if @extra_fd
+ * became readable (or hung up) before a full line arrived -- in which case
+ * @extra_signalled is set and the caller decides what that means.
+ *
+ * stdio is deliberately not used for stdin anywhere in the helper: a caller
+ * that must wait on stdin and on another descriptor at the same time needs
+ * poll(), and poll() cannot see bytes that stdio has already buffered.
+ */
+int read_line_from_agent (char *out, size_t out_size, int extra_fd, gboolean *extra_signalled);
+
 char *read_cookie (int argc, char **argv);
 
 gboolean send_dbus_message (const char *cookie, const char *user, int pidfd, int uid);
