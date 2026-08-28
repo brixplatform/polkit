@@ -58,7 +58,7 @@
  * not prompt. Distributions that do not ship it get exactly the behaviour
  * polkit had before this existed.
  */
-#define PAM_SERVICE_NAME_CONCURRENT "polkit-1-biometric"
+#define PAM_SERVICE_NAME_CONCURRENT "polkit-1-concurrent"
 
 /* Where the above is looked for. Linux-PAM reads both, preferring the
  * administrator's copy in the first.
