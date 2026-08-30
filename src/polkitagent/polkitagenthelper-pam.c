@@ -34,6 +34,8 @@
 #include <signal.h>
 #include <syslog.h>
 #include <pwd.h>
+#include <time.h>
+#include <sys/random.h>
 #include <security/pam_appl.h>
 
 #include <polkit/polkit.h>
@@ -117,6 +119,49 @@ send_to_helper (const gchar *str1,
   g_free (tmp2);
 }
 
+/* What to do about PAM's delay on a failed authentication.
+ *
+ * Winning the race fails this stack on purpose: the conversation refuses, no
+ * module can finish, and main() reads the win afterwards. PAM cannot tell that
+ * apart from somebody getting their password wrong, so it does what it does for
+ * a wrong password -- pam_unix asks for two seconds, and libpam sleeps them out
+ * before pam_authenticate returns. The finger was recognised immediately and
+ * the dialog sat there for two seconds anyway.
+ *
+ * So skip it for exactly that case and keep it for every other. The delay is
+ * what makes guessing expensive, and an authentication that really did fail
+ * still pays it.
+ */
+static void
+fail_delay (int retval, unsigned usec, void *appdata)
+{
+  ConversationData *conversation_data = appdata;
+  struct timespec remaining;
+
+  if (conversation_data != NULL && conversation_data->concurrent_won)
+    return;
+
+  if (retval == PAM_SUCCESS || usec == 0)
+    return;
+
+  /* Up to a quarter again, never less, so the time taken says as little as
+   * possible about where the stack gave up. Added rather than spread either
+   * way: shortening a delay to hide it is not a trade this has to make, and a
+   * source of randomness that failed must not silently mean no delay at all.
+   */
+  {
+    unsigned int jitter = 0;
+
+    if (getrandom (&jitter, sizeof jitter, GRND_NONBLOCK) == (ssize_t) sizeof jitter)
+      usec += jitter % (usec / 4 + 1);
+  }
+
+  remaining.tv_sec = usec / 1000000;
+  remaining.tv_nsec = (long) (usec % 1000000) * 1000;
+  while (nanosleep (&remaining, &remaining) != 0 && errno == EINTR)
+    ;
+}
+
 /* The whole of what it means to authenticate: the stack ran, the account is
  * permitted, and the user it ended up authenticating is the one we asked
  * about. Both the password stack and the concurrent stack must clear all
@@ -155,6 +200,16 @@ authenticate_with_pam (const char *service,
     }
 
   rc = pam_set_item (pam_h, PAM_RUSER, user_to_auth);
+  if (rc != PAM_SUCCESS)
+    {
+      fprintf (stderr, "polkit-agent-helper-1: pam_set_item failed: %s\n", pam_strerror (pam_h, rc));
+      goto out;
+    }
+
+  /* Ours to serve rather than libpam's, so a stack failed on purpose does not
+   * sleep off a delay meant for a stack that failed. See fail_delay.
+   */
+  rc = pam_set_item (pam_h, PAM_FAIL_DELAY, (const void *) fail_delay);
   if (rc != PAM_SUCCESS)
     {
       fprintf (stderr, "polkit-agent-helper-1: pam_set_item failed: %s\n", pam_strerror (pam_h, rc));
