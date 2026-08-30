@@ -380,9 +380,42 @@ start_concurrent_authentication (const char *user_to_auth,
   conversation.conv = null_conversation_function;
   conversation.appdata_ptr = NULL;
 
-  verdict = authenticate_with_pam (PAM_SERVICE_NAME_CONCURRENT, user_to_auth,
-                                   &conversation, TRUE)
-            ? CONCURRENT_VERDICT_SUCCESS : 'n';
+  /* Tried again when it fails at once. Ending a request kills the previous
+   * child mid-verify, so its claim on the reader dies with its bus connection
+   * rather than with a Release -- and fprintd is still tearing that down when
+   * this request's pam_fprintd asks, which comes back as "already claimed" in
+   * well under a second. Nothing a person did in under a second was a finger
+   * being read and refused, so a fast failure is retried and a slow one is
+   * the verdict it always was. Bounded, because a stack that fails fast
+   * forever -- no reader, nothing enrolled -- must still end.
+   */
+  {
+    int attempt;
+
+    for (attempt = 0; ; attempt++)
+      {
+        struct timespec begin, end;
+        long took_ms;
+
+        clock_gettime (CLOCK_MONOTONIC, &begin);
+        verdict = authenticate_with_pam (PAM_SERVICE_NAME_CONCURRENT, user_to_auth,
+                                         &conversation, TRUE)
+                  ? CONCURRENT_VERDICT_SUCCESS : 'n';
+        clock_gettime (CLOCK_MONOTONIC, &end);
+
+        took_ms = (end.tv_sec - begin.tv_sec) * 1000
+                + (end.tv_nsec - begin.tv_nsec) / 1000000;
+
+        if (verdict == CONCURRENT_VERDICT_SUCCESS || took_ms > 1000 || attempt >= 5)
+          break;
+
+        {
+          struct timespec pause = { 0, 300 * 1000 * 1000 };
+          while (nanosleep (&pause, &pause) != 0 && errno == EINTR)
+            ;
+        }
+      }
+  }
 
   /* A short write or a dead parent both mean nobody is listening any more. */
   if (write (pipe_fds[1], &verdict, 1) != 1)
