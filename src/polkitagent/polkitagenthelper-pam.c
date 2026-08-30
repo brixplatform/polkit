@@ -33,6 +33,7 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <syslog.h>
+#include <pwd.h>
 #include <security/pam_appl.h>
 
 #include <polkit/polkit.h>
@@ -124,12 +125,27 @@ send_to_helper (const gchar *str1,
 static gboolean
 authenticate_with_pam (const char *service,
                        const char *user_to_auth,
-                       struct pam_conv *conversation)
+                       struct pam_conv *conversation,
+                       gboolean drop_for_auth)
 {
   pam_handle_t *pam_h = NULL;
   const void *authed_user;
   gboolean authenticated = FALSE;
+  uid_t auth_uid = (uid_t) -1;
   int rc;
+
+  if (drop_for_auth)
+    {
+      struct passwd *pw = getpwnam (user_to_auth);
+
+      if (pw == NULL)
+        {
+          syslog (LOG_NOTICE, "no such user '%s' for %s", user_to_auth, service);
+          return FALSE;
+        }
+
+      auth_uid = pw->pw_uid;
+    }
 
   rc = pam_start (service, user_to_auth, conversation, &pam_h);
   if (rc != PAM_SUCCESS)
@@ -145,8 +161,37 @@ authenticate_with_pam (const char *service,
       goto out;
     }
 
-  /* is user really user? */
+  /* is user really user?
+   *
+   * The reader stack runs as the user being authenticated. This helper is
+   * setuid root, and a stack running as root asks fprintd to verify somebody
+   * else -- which fprintd guards behind `setusername`'s `auth_admin_keep`.
+   * That authorization goes to polkitd, polkitd needs an agent, and the only
+   * agent is the one already waiting on this very authentication. It
+   * deadlocks, and the sensor reads a finger that never becomes a verdict. As
+   * the user, the same stack takes fprintd's `allow_active=yes` path for
+   * `verify` and asks polkit for nothing.
+   *
+   * Only the effective uid, and only for this phase: `pam_acct_mgmt` below
+   * reads the shadow file and genuinely needs root. A child that had given up
+   * root for good cleared the auth phase and then failed the account one,
+   * which reads from the outside exactly like a finger that did not match.
+   */
+  if (auth_uid != (uid_t) -1 && seteuid (auth_uid) != 0)
+    {
+      syslog (LOG_NOTICE, "could not drop to uid %d for %s: %m", (int) auth_uid, service);
+      goto out;
+    }
+
   rc = pam_authenticate (pam_h, 0);
+
+  /* Root again before anything that needs it, whatever the stack decided. */
+  if (auth_uid != (uid_t) -1 && seteuid (0) != 0)
+    {
+      syslog (LOG_NOTICE, "could not regain root after %s: %m", service);
+      goto out;
+    }
+
   if (rc != PAM_SUCCESS)
     {
       fprintf (stderr, "polkit-agent-helper-1: pam_authenticate failed: %s\n", pam_strerror (pam_h, rc));
@@ -280,7 +325,8 @@ start_concurrent_authentication (const char *user_to_auth,
   conversation.conv = null_conversation_function;
   conversation.appdata_ptr = NULL;
 
-  verdict = authenticate_with_pam (PAM_SERVICE_NAME_CONCURRENT, user_to_auth, &conversation)
+  verdict = authenticate_with_pam (PAM_SERVICE_NAME_CONCURRENT, user_to_auth,
+                                   &conversation, TRUE)
             ? CONCURRENT_VERDICT_SUCCESS : 'n';
 
   /* A short write or a dead parent both mean nobody is listening any more. */
@@ -450,7 +496,7 @@ main (int argc, char *argv[])
    */
   conversation_data.verdict_fd = start_concurrent_authentication (user_to_auth, &concurrent_child);
 
-  if (!authenticate_with_pam (PAM_SERVICE_NAME, user_to_auth, &pam_conversation) &&
+  if (!authenticate_with_pam (PAM_SERVICE_NAME, user_to_auth, &pam_conversation, FALSE) &&
       !conversation_data.concurrent_won)
     {
       /* if run via systemd socket, failed authentication won't taint the system using SuccessExitStatus=2*/
@@ -547,11 +593,17 @@ conversation_function (int n, const struct pam_message **msg, struct pam_respons
               int verdict_fd = conversation_data != NULL ? conversation_data->verdict_fd : -1;
               char verdict;
 
-              if (read_line_from_agent (buf, sizeof buf, verdict_fd, &concurrent_ready) == 1)
+              int line = read_line_from_agent (buf, sizeof buf, verdict_fd, &concurrent_ready);
+
+              if (line == 1)
                 break;
 
               if (!concurrent_ready)
-                goto error;
+                {
+                  syslog (LOG_NOTICE, "no answer from the agent: %s",
+                          line == 0 ? "it closed the connection" : strerror (errno));
+                  goto error;
+                }
 
               /* Success there ends the request here. Failure only means this
                * prompt is once again the only way through, so stop watching
@@ -569,7 +621,10 @@ conversation_function (int n, const struct pam_message **msg, struct pam_respons
 
           aresp[i].resp = strdup (buf);
           if (aresp[i].resp == NULL)
-            goto error;
+            {
+              syslog (LOG_NOTICE, "out of memory holding the agent's answer");
+              goto error;
+            }
           break;
 
         case PAM_ERROR_MSG:
@@ -581,6 +636,8 @@ conversation_function (int n, const struct pam_message **msg, struct pam_respons
           break;
 
         default:
+          syslog (LOG_NOTICE, "the stack asked something this helper cannot relay "
+                  "(message style %d)", msg[i]->msg_style);
           goto error;
         }
     }
