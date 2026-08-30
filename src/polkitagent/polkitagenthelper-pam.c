@@ -562,6 +562,23 @@ conversation_function (int n, const struct pam_message **msg, struct pam_respons
 
   ConversationData *conversation_data = data;
 
+  /* The race is already won, so there is nothing left to ask.
+   *
+   * Winning it aborts whichever prompt was waiting, and the intent is that
+   * the stack ends there. It only does where a failed conversation is fatal
+   * to the module holding it. A module that shrugs one off -- pam_brix_pin
+   * returns PAM_IGNORE, because a conversation it cannot complete is not a
+   * PIN anybody got wrong -- hands the stack to the next module instead, and
+   * that module puts a password prompt on screen that no one will ever
+   * answer. The finger was accepted and the dialog asks for a password: the
+   * two things a person would never guess are the same event.
+   *
+   * So refuse from here on. Every later prompt fails at once, the stack runs
+   * out, and main() reads the win it already has.
+   */
+  if (conversation_data != NULL && conversation_data->concurrent_won)
+    return PAM_CONV_ERR;
+
   if (n <= 0 || n > PAM_MAX_NUM_MSG)
     return PAM_CONV_ERR;
 
